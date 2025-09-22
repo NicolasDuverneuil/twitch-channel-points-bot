@@ -149,32 +149,26 @@ class TwitchEventSub:
 def verify_signature(message_signature, message_timestamp, message_body, secret):
     """Vérifie la signature du webhook Twitch"""
     try:
-        # Assurer que tout est en string
-        timestamp_str = str(message_timestamp)
-        body_str = str(message_body)
-        secret_str = str(secret)
+        # Message à signer : timestamp + body (exactement comme Twitch le fait)
+        message_to_sign = message_timestamp + message_body
         
-        # Créer le message à signer
-        message = timestamp_str + body_str
-        
-        # Calculer la signature attendue
-        expected_signature = hmac.new(
-            secret_str.encode('utf-8'),
-            message.encode('utf-8'),
+        # Calculer le HMAC-SHA256
+        signature = hmac.new(
+            secret.encode('utf-8'),
+            message_to_sign.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
         
-        expected_signature_formatted = f"sha256={expected_signature}"
+        expected_signature = f"sha256={signature}"
         
-        # Debug
-        logger.info(f"DEBUG - Expected signature: {expected_signature_formatted}")
+        # Debug détaillé
+        logger.info(f"DEBUG - Message à signer: '{message_to_sign[:100]}...' (total: {len(message_to_sign)} chars)")
+        logger.info(f"DEBUG - HMAC calculé: {signature}")
+        logger.info(f"DEBUG - Expected signature: {expected_signature}")
         logger.info(f"DEBUG - Received signature: {message_signature}")
         
-        # Comparer
-        result = hmac.compare_digest(expected_signature_formatted, str(message_signature))
-        logger.info(f"DEBUG - Signatures match: {result}")
-        
-        return result
+        # Comparaison sécurisée
+        return hmac.compare_digest(expected_signature, message_signature)
         
     except Exception as e:
         logger.error(f"Erreur dans verify_signature: {e}")
@@ -193,11 +187,13 @@ async def handle_webhook(request):
     logger.info(f"DEBUG - Timestamp: {message_timestamp}")
     logger.info(f"DEBUG - Message type: {message_type}")
     logger.info(f"DEBUG - Secret utilisé: {WEBHOOK_SECRET[:10]}...")
+    logger.info(f"DEBUG - Body complet: {body}")
+    logger.info(f"DEBUG - Body length: {len(body)}")
+    logger.info(f"DEBUG - Message à signer: '{message_timestamp + body}'[:100]...")
     
     # Vérification de la signature
     if not verify_signature(message_signature, message_timestamp, body, WEBHOOK_SECRET):
         logger.warning("Signature webhook invalide")
-        logger.info(f"DEBUG - Body reçu: {body[:200]}...")
         return web.Response(status=403)
     
     # Vérification du timestamp (évite les attaques de replay)
