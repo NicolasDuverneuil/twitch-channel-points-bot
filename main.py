@@ -90,6 +90,9 @@ class TwitchEventSub:
             }
         }
         
+        logger.info(f"🔐 Création abonnement avec secret: '{WEBHOOK_SECRET}' (longueur: {len(WEBHOOK_SECRET)})")
+        logger.info(f"📞 Callback URL: {CALLBACK_URL}")
+        
         async with self.session.post(url, headers=headers, json=payload) as response:
             if response.status == 202:
                 data = await response.json()
