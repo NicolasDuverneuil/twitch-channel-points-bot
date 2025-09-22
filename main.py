@@ -103,22 +103,29 @@ class TwitchEventSub:
                 return False
     
     async def delete_all_subscriptions(self):
-        """Supprime tous les abonnements EventSub existants"""
-        subscriptions = await self.list_subscriptions()
+        """Supprime TOUS les abonnements EventSub existants (pas juste les channel points)"""
+        url = "https://api.twitch.tv/helix/eventsub/subscriptions"
+        headers = {
+            "Client-Id": TWITCH_CLIENT_ID,
+            "Authorization": f"Bearer {self.access_token}"
+        }
         
-        for sub in subscriptions:
-            if sub['type'] == 'channel.channel_points_custom_reward_redemption.add':
-                url = f"https://api.twitch.tv/helix/eventsub/subscriptions?id={sub['id']}"
-                headers = {
-                    "Client-Id": TWITCH_CLIENT_ID,
-                    "Authorization": f"Bearer {self.access_token}"
-                }
+        # Récupérer tous les abonnements
+        async with self.session.get(url, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                logger.info(f"Trouvé {len(data['data'])} abonnements à supprimer")
                 
-                async with self.session.delete(url, headers=headers) as response:
-                    if response.status == 204:
-                        logger.info(f"Abonnement supprimé: {sub['id']}")
-                    else:
-                        logger.error(f"Erreur suppression: {response.status}")
+                # Supprimer chaque abonnement
+                for sub in data['data']:
+                    delete_url = f"{url}?id={sub['id']}"
+                    async with self.session.delete(delete_url, headers=headers) as del_response:
+                        if del_response.status == 204:
+                            logger.info(f"Abonnement supprimé: {sub['id']} (Type: {sub['type']}, Status: {sub['status']})")
+                        else:
+                            logger.error(f"Erreur suppression {sub['id']}: {del_response.status}")
+            else:
+                logger.error(f"Erreur récupération abonnements: {response.status}")
     
     async def list_subscriptions(self):
         """Liste tous les abonnements EventSub actifs"""
@@ -345,6 +352,10 @@ if __name__ == "__main__":
         exit(1)
     
     logger.info("✅ Configuration OK, démarrage du script...")
+    logger.info(f"🔍 Debug - WEBHOOK_SECRET: '{WEBHOOK_SECRET}'")
+    logger.info(f"🔍 Debug - Longueur du secret: {len(WEBHOOK_SECRET)} caractères")
+    logger.info(f"🔍 Debug - CALLBACK_URL: {CALLBACK_URL}")
+    logger.info(f"🔍 Debug - BROADCASTER: {BROADCASTER_USER_LOGIN}")
     
     # Lancement du script
     asyncio.run(main())
