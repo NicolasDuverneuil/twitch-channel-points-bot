@@ -1,30 +1,27 @@
 import asyncio
 import json
-import hmac
-import hashlib
-import time
 import os
 from datetime import datetime
 import aiohttp
-from aiohttp import web, ClientSession
 import logging
+import websockets
 
-# Configuration via variables d'environnement (plus sécurisé)
+# Configuration via variables d'environnement
 TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "votre_client_id_ici")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "votre_client_secret_ici")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "votre_secret_webhook_ici")
-CALLBACK_URL = os.getenv("CALLBACK_URL", "https://votre-app.onrender.com/webhook")
 BROADCASTER_USER_LOGIN = os.getenv("BROADCASTER_USER_LOGIN", "nom_du_streamer")
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class TwitchEventSub:
+class TwitchEventSubWebSocket:
     def __init__(self):
         self.access_token = None
         self.broadcaster_user_id = None
         self.session = None
+        self.websocket = None
+        self.session_id = None
         
     async def get_app_access_token(self):
         """Obtient un token d'accès d'application"""
@@ -68,8 +65,32 @@ class TwitchEventSub:
                 logger.error(f"Erreur lors de la récupération de l'ID: {response.status}")
                 return False
     
+    async def connect_websocket(self):
+        """Se connecte au WebSocket EventSub de Twitch"""
+        websocket_url = "wss://eventsub.wss.twitch.tv/ws"
+        
+        try:
+            self.websocket = await websockets.connect(websocket_url)
+            logger.info("Connexion WebSocket établie")
+            
+            # Écouter le message de bienvenue
+            welcome_message = await self.websocket.recv()
+            welcome_data = json.loads(welcome_message)
+            
+            if welcome_data["metadata"]["message_type"] == "session_welcome":
+                self.session_id = welcome_data["payload"]["session"]["id"]
+                logger.info(f"Session WebSocket établie: {self.session_id}")
+                return True
+            else:
+                logger.error("Message de bienvenue attendu non reçu")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Erreur de connexion WebSocket: {e}")
+            return False
+    
     async def create_eventsub_subscription(self):
-        """Crée un abonnement EventSub pour les channel point redemptions"""
+        """Crée un abonnement EventSub pour les channel point redemptions via WebSocket"""
         url = "https://api.twitch.tv/helix/eventsub/subscriptions"
         headers = {
             "Client-Id": TWITCH_CLIENT_ID,
@@ -84,19 +105,15 @@ class TwitchEventSub:
                 "broadcaster_user_id": self.broadcaster_user_id
             },
             "transport": {
-                "method": "webhook",
-                "callback": CALLBACK_URL,
-                "secret": WEBHOOK_SECRET
+                "method": "websocket",
+                "session_id": self.session_id
             }
         }
-        
-        logger.info(f"🔐 Création abonnement avec secret: '{WEBHOOK_SECRET}' (longueur: {len(WEBHOOK_SECRET)})")
-        logger.info(f"📞 Callback URL: {CALLBACK_URL}")
         
         async with self.session.post(url, headers=headers, json=payload) as response:
             if response.status == 202:
                 data = await response.json()
-                logger.info("Abonnement EventSub créé avec succès")
+                logger.info("Abonnement EventSub WebSocket créé avec succès")
                 logger.info(f"ID de l'abonnement: {data['data'][0]['id']}")
                 return True
             else:
@@ -104,31 +121,6 @@ class TwitchEventSub:
                 logger.error(f"Erreur lors de la création de l'abonnement: {response.status}")
                 logger.error(f"Détails: {error_data}")
                 return False
-    
-    async def delete_all_subscriptions(self):
-        """Supprime TOUS les abonnements EventSub existants (pas juste les channel points)"""
-        url = "https://api.twitch.tv/helix/eventsub/subscriptions"
-        headers = {
-            "Client-Id": TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {self.access_token}"
-        }
-        
-        # Récupérer tous les abonnements
-        async with self.session.get(url, headers=headers) as response:
-            if response.status == 200:
-                data = await response.json()
-                logger.info(f"Trouvé {len(data['data'])} abonnements à supprimer")
-                
-                # Supprimer chaque abonnement
-                for sub in data['data']:
-                    delete_url = f"{url}?id={sub['id']}"
-                    async with self.session.delete(delete_url, headers=headers) as del_response:
-                        if del_response.status == 204:
-                            logger.info(f"Abonnement supprimé: {sub['id']} (Type: {sub['type']}, Status: {sub['status']})")
-                        else:
-                            logger.error(f"Erreur suppression {sub['id']}: {del_response.status}")
-            else:
-                logger.error(f"Erreur récupération abonnements: {response.status}")
     
     async def list_subscriptions(self):
         """Liste tous les abonnements EventSub actifs"""
@@ -148,94 +140,37 @@ class TwitchEventSub:
             else:
                 logger.error(f"Erreur lors de la récupération des abonnements: {response.status}")
                 return []
-
-def verify_signature(message_signature, message_timestamp, message_body, secret):
-    """Vérifie la signature du webhook Twitch"""
-    try:
-        # Message à signer : timestamp + body (exactement comme Twitch le fait)
-        message_to_sign = message_timestamp + message_body
+    
+    async def listen_for_events(self):
+        """Écoute les événements sur le WebSocket"""
+        logger.info("Écoute des événements channel points en cours...")
         
-        # Calculer le HMAC-SHA256
-        signature = hmac.new(
-            secret.encode('utf-8'),
-            message_to_sign.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        
-        expected_signature = f"sha256={signature}"
-        
-        # Debug détaillé
-        logger.info(f"DEBUG - Message à signer: '{message_to_sign[:100]}...' (total: {len(message_to_sign)} chars)")
-        logger.info(f"DEBUG - HMAC calculé: {signature}")
-        logger.info(f"DEBUG - Expected signature: {expected_signature}")
-        logger.info(f"DEBUG - Received signature: {message_signature}")
-        
-        # Comparaison sécurisée
-        return hmac.compare_digest(expected_signature, message_signature)
-        
-    except Exception as e:
-        logger.error(f"Erreur dans verify_signature: {e}")
-        return False
-
-async def handle_webhook(request):
-    """Gestionnaire pour les webhooks Twitch"""
-    message_signature = request.headers.get('Twitch-Eventsub-Message-Signature')
-    message_timestamp = request.headers.get('Twitch-Eventsub-Message-Timestamp')
-    message_type = request.headers.get('Twitch-Eventsub-Message-Type')
-    
-    body = await request.text()
-    
-    # Debug des headers et signature
-    logger.info(f"DEBUG - Signature reçue: {message_signature}")
-    logger.info(f"DEBUG - Timestamp: {message_timestamp}")
-    logger.info(f"DEBUG - Message type: {message_type}")
-    logger.info(f"DEBUG - Secret utilisé: {WEBHOOK_SECRET[:10]}...")
-    logger.info(f"DEBUG - Body complet: {body}")
-    logger.info(f"DEBUG - Body length: {len(body)}")
-    logger.info(f"DEBUG - Message à signer: '{message_timestamp + body}'[:100]...")
-    
-    # Vérification de la signature
-    if not verify_signature(message_signature, message_timestamp, body, WEBHOOK_SECRET):
-        logger.warning("Signature webhook invalide")
-        return web.Response(status=403)
-    
-    # Vérification du timestamp (évite les attaques de replay)
-    current_time = int(time.time())
-    message_time = int(message_timestamp)
-    if abs(current_time - message_time) > 600:  # 10 minutes
-        logger.warning("Message webhook trop ancien")
-        return web.Response(status=403)
-    
-    data = json.loads(body)
-    
-    # Gestion des différents types de messages
-    if message_type == 'webhook_callback_verification':
-        # Confirmation de l'abonnement
-        logger.info("Confirmation de l'abonnement webhook")
-        return web.Response(text=data['challenge'])
-    
-    elif message_type == 'notification':
-        # Événement de dépense de points de chaîne
-        event = data['event']
-        logger.info("=== CHANNEL POINTS REDEMPTION ===")
-        logger.info(f"Utilisateur: {event['user_name']} (ID: {event['user_id']})")
-        logger.info(f"Récompense: {event['reward']['title']}")
-        logger.info(f"Coût: {event['reward']['cost']} points")
-        logger.info(f"Message utilisateur: {event.get('user_input', 'Aucun message')}")
-        logger.info(f"Statut: {event['status']}")
-        logger.info(f"Timestamp: {event['redeemed_at']}")
-        
-        # Ici vous pouvez ajouter votre logique personnalisée
-        await process_channel_points_redemption(event)
-        
-        return web.Response(status=204)
-    
-    elif message_type == 'revocation':
-        # Révocation de l'abonnement
-        logger.info("Abonnement révoqué")
-        return web.Response(status=204)
-    
-    return web.Response(status=200)
+        try:
+            while True:
+                message = await self.websocket.recv()
+                data = json.loads(message)
+                
+                message_type = data["metadata"]["message_type"]
+                
+                if message_type == "notification":
+                    event = data["payload"]["event"]
+                    await self.process_channel_points_redemption(event)
+                    
+                elif message_type == "session_keepalive":
+                    logger.debug("Keepalive reçu")
+                    
+                elif message_type == "session_reconnect":
+                    logger.info("Reconnexion demandée par Twitch")
+                    # Ici on pourrait implémenter la reconnexion automatique
+                    break
+                    
+                else:
+                    logger.info(f"Message reçu: {message_type}")
+                    
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("Connexion WebSocket fermée")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'écoute des événements: {e}")
 
 async def process_channel_points_redemption(event):
     """Traite les événements de dépense de points de chaîne"""
@@ -243,6 +178,14 @@ async def process_channel_points_redemption(event):
     reward_title = event['reward']['title']
     cost = event['reward']['cost']
     user_input = event.get('user_input', '')
+    
+    logger.info("=== CHANNEL POINTS REDEMPTION ===")
+    logger.info(f"Utilisateur: {user_name} (ID: {event['user_id']})")
+    logger.info(f"Récompense: {reward_title}")
+    logger.info(f"Coût: {cost} points")
+    logger.info(f"Message utilisateur: {user_input if user_input else 'Aucun message'}")
+    logger.info(f"Statut: {event['status']}")
+    logger.info(f"Timestamp: {event['redeemed_at']}")
     
     # Exemple de logiques personnalisées basées sur le type de récompense
     if "song" in reward_title.lower() or "musique" in reward_title.lower():
@@ -265,66 +208,64 @@ async def process_channel_points_redemption(event):
 
 async def health_check(request):
     """Route de test pour vérifier que le serveur fonctionne"""
-    return web.Response(text="Bot Twitch Channel Points - Serveur actif !", status=200)
+    return aiohttp.web.Response(text="Bot Twitch Channel Points WebSocket - Serveur actif !", status=200)
 
-async def start_webhook_server():
-    """Démarre le serveur webhook"""
-    app = web.Application()
-    app.router.add_post('/webhook', handle_webhook)
-    app.router.add_get('/', health_check)  # Route pour éviter les 404
+async def start_health_server():
+    """Démarre un serveur de santé simple pour Render"""
+    app = aiohttp.web.Application()
+    app.router.add_get('/', health_check)
     
-    runner = web.AppRunner(app)
+    runner = aiohttp.web.AppRunner(app)
     await runner.setup()
     
-    # Utilise le port fourni par Render (ou 8080 en local)
     port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     
-    logger.info(f"Serveur webhook démarré sur port {port}")
-    logger.info("Prêt à recevoir les webhooks Twitch !")
+    logger.info(f"Serveur de santé démarré sur port {port}")
 
 async def main():
     """Fonction principale"""
-    eventsub = TwitchEventSub()
+    eventsub = TwitchEventSubWebSocket()
     
     # Initialisation de la session HTTP
-    eventsub.session = ClientSession()
+    eventsub.session = aiohttp.ClientSession()
     
     try:
-        # 1. Obtenir le token d'accès
+        # 1. Démarrer le serveur de santé (pour Render)
+        await start_health_server()
+        
+        # 2. Obtenir le token d'accès
         if not await eventsub.get_app_access_token():
             return
         
-        # 2. Obtenir l'ID du broadcaster
+        # 3. Obtenir l'ID du broadcaster
         if not await eventsub.get_broadcaster_id():
             return
         
-        # 3. Nettoyer les anciens abonnements (debug)
-        logger.info("Nettoyage des anciens abonnements...")
-        await eventsub.delete_all_subscriptions()
-        
-        # 4. Lister les abonnements existants (optionnel)
-        await eventsub.list_subscriptions()
+        # 4. Se connecter au WebSocket
+        if not await eventsub.connect_websocket():
+            return
         
         # 5. Créer l'abonnement EventSub
         if not await eventsub.create_eventsub_subscription():
             return
         
-        # 6. Démarrer le serveur webhook
-        await start_webhook_server()
+        # 6. Lister les abonnements (optionnel)
+        await eventsub.list_subscriptions()
         
-        logger.info("Script en cours d'exécution. Appuyez sur Ctrl+C pour arrêter.")
+        logger.info("Bot prêt ! En attente des channel points...")
         
-        # Garder le script en vie
-        while True:
-            await asyncio.sleep(1)
+        # 7. Écouter les événements
+        await eventsub.listen_for_events()
     
     except KeyboardInterrupt:
         logger.info("Arrêt du script...")
     
     finally:
         # Nettoyage
+        if eventsub.websocket:
+            await eventsub.websocket.close()
         if eventsub.session:
             await eventsub.session.close()
 
@@ -338,23 +279,11 @@ if __name__ == "__main__":
         logger.error("❌ TWITCH_CLIENT_SECRET manquant dans les variables d'environnement")
         exit(1)
     
-    if not WEBHOOK_SECRET or WEBHOOK_SECRET == "votre_secret_webhook_ici":
-        logger.error("❌ WEBHOOK_SECRET manquant dans les variables d'environnement")
-        exit(1)
-    
-    if not CALLBACK_URL or CALLBACK_URL == "https://votre-app.onrender.com/webhook":
-        logger.error("❌ CALLBACK_URL manquant dans les variables d'environnement")
-        exit(1)
-    
     if not BROADCASTER_USER_LOGIN or BROADCASTER_USER_LOGIN == "nom_du_streamer":
         logger.error("❌ BROADCASTER_USER_LOGIN manquant dans les variables d'environnement")
         exit(1)
     
-    logger.info("✅ Configuration OK, démarrage du script...")
-    logger.info(f"🔍 Debug - WEBHOOK_SECRET: '{WEBHOOK_SECRET}'")
-    logger.info(f"🔍 Debug - Longueur du secret: {len(WEBHOOK_SECRET)} caractères")
-    logger.info(f"🔍 Debug - CALLBACK_URL: {CALLBACK_URL}")
-    logger.info(f"🔍 Debug - BROADCASTER: {BROADCASTER_USER_LOGIN}")
+    logger.info("✅ Configuration OK, démarrage du bot WebSocket...")
     
     # Lancement du script
     asyncio.run(main())
